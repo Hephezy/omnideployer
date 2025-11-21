@@ -1,3 +1,5 @@
+"use client";
+
 import React, { createContext, useContext, useState, useCallback, useEffect, useMemo } from 'react';
 import {
   IChainAdapter,

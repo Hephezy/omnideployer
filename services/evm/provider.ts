@@ -5,11 +5,7 @@ export class EVMProviderService {
   private providerCache: Map<number, ethers.JsonRpcProvider> = new Map();
   private healthyRpcCache: Map<number, string> = new Map();
 
-  /**
-   * Get a working provider for a chain with automatic fallback
-   */
   async getProvider(chain: ChainConfig): Promise<ethers.JsonRpcProvider> {
-    // Check cache first
     const cached = this.providerCache.get(chain.chainId);
     if (cached) {
       try {
@@ -21,7 +17,6 @@ export class EVMProviderService {
       }
     }
 
-    // Try each RPC URL
     for (const rpcUrl of chain.rpcUrls) {
       try {
         const provider = new ethers.JsonRpcProvider(rpcUrl, {
@@ -29,7 +24,6 @@ export class EVMProviderService {
           name: chain.name,
         });
 
-        // Test the connection
         const blockNumber = await Promise.race([
           provider.getBlockNumber(),
           new Promise<never>((_, reject) =>
@@ -51,9 +45,6 @@ export class EVMProviderService {
     throw new Error(`All RPC endpoints failed for ${chain.name}`);
   }
 
-  /**
-   * Get browser provider (MetaMask, etc.)
-   */
   async getBrowserProvider(): Promise<ethers.BrowserProvider> {
     if (!window.ethereum) {
       throw new Error("No wallet detected. Please install MetaMask.");
@@ -61,17 +52,11 @@ export class EVMProviderService {
     return new ethers.BrowserProvider(window.ethereum);
   }
 
-  /**
-   * Get signer from browser provider
-   */
-  async getSigner(): Promise<ethers.Signer> {
+  async getSigner(): Promise<ethers.JsonRpcSigner> {
     const provider = await this.getBrowserProvider();
     return provider.getSigner();
   }
 
-  /**
-   * Estimate gas for a transaction
-   */
   async estimateGas(
     chain: ChainConfig,
     tx: ethers.TransactionRequest
@@ -114,9 +99,6 @@ export class EVMProviderService {
     };
   }
 
-  /**
-   * Get native token balance
-   */
   async getBalance(
     chain: ChainConfig,
     address: string
@@ -133,9 +115,6 @@ export class EVMProviderService {
     };
   }
 
-  /**
-   * Wait for transaction with proper confirmation count
-   */
   async waitForTransaction(
     chain: ChainConfig,
     txHash: string,
@@ -146,20 +125,22 @@ export class EVMProviderService {
     let lastConfirmations = 0;
     const checkConfirmations = async () => {
       const receipt = await provider.getTransactionReceipt(txHash);
-      if (receipt && receipt.confirmations !== lastConfirmations) {
-        lastConfirmations = receipt.confirmations;
-        onConfirmation?.(receipt.confirmations);
+      if (receipt) {
+        const confirmations = await receipt.confirmations();
+        if (confirmations !== lastConfirmations) {
+          lastConfirmations = confirmations;
+          onConfirmation?.(confirmations);
+        }
       }
     };
 
-    // Poll for confirmations
     const interval = setInterval(checkConfirmations, chain.avgBlockTime * 1000);
 
     try {
       const receipt = await provider.waitForTransaction(
         txHash,
         chain.confirmations,
-        120000 // 2 minute timeout
+        120000
       );
 
       if (!receipt) {
@@ -172,14 +153,10 @@ export class EVMProviderService {
     }
   }
 
-  /**
-   * Clear provider cache
-   */
   clearCache(): void {
     this.providerCache.clear();
     this.healthyRpcCache.clear();
   }
 }
 
-// Singleton instance
 export const evmProvider = new EVMProviderService();

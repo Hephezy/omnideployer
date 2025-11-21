@@ -1,21 +1,18 @@
-// hooks/useWeb3.ts - Enhanced version
-
-import { ChainConfig } from "@/config/chains/types";
+import { ChainConfig } from "@/config/constants";
 import { useCallback, useEffect, useState, useRef } from "react";
 import { ethers } from "ethers";
-import { DeployerError, ErrorCode } from "@/utils/errors";
 
 interface Web3State {
   account: string | null;
   chainId: number | null;
   isConnecting: boolean;
   isConnected: boolean;
-  error: DeployerError | null;
+  error: string | null;
   balance: string | null;
   provider: ethers.BrowserProvider | null;
 }
 
-interface UseWeb3Return extends Web3State {
+interface UseWeb3Return extends Omit<Web3State, "provider"> {
   connect: () => Promise<void>;
   disconnect: () => void;
   switchNetwork: (chain: ChainConfig) => Promise<boolean>;
@@ -37,18 +34,15 @@ export function useWeb3(): UseWeb3Return {
 
   const providerRef = useRef<ethers.BrowserProvider | null>(null);
 
-  // Check if ethereum is available
   const getEthereum = useCallback(() => {
     if (typeof window === "undefined") return null;
     return window.ethereum ?? null;
   }, []);
 
-  // Update state helper
   const updateState = useCallback((updates: Partial<Web3State>) => {
     setState((prev) => ({ ...prev, ...updates }));
   }, []);
 
-  // Fetch balance
   const refreshBalance = useCallback(async () => {
     const ethereum = getEthereum();
     if (!ethereum || !state.account) return;
@@ -62,19 +56,12 @@ export function useWeb3(): UseWeb3Return {
     }
   }, [getEthereum, state.account, updateState]);
 
-  // Connect wallet
   const connect = useCallback(async () => {
     const ethereum = getEthereum();
 
     if (!ethereum) {
       updateState({
-        error: new DeployerError({
-          code: ErrorCode.WALLET_NOT_FOUND,
-          message: "No Ethereum provider found",
-          userMessage: "No wallet detected. Please install MetaMask.",
-          suggestion: "Install MetaMask from metamask.io",
-          recoverable: false,
-        }),
+        error: "No wallet detected. Please install MetaMask.",
       });
       return;
     }
@@ -82,7 +69,6 @@ export function useWeb3(): UseWeb3Return {
     updateState({ isConnecting: true, error: null });
 
     try {
-      // Request accounts
       const accounts = (await ethereum.request({
         method: "eth_requestAccounts",
       })) as string[];
@@ -91,18 +77,15 @@ export function useWeb3(): UseWeb3Return {
         throw new Error("No accounts returned");
       }
 
-      // Get chain ID
       const chainIdHex = (await ethereum.request({
         method: "eth_chainId",
       })) as string;
 
       const chainId = parseInt(chainIdHex, 16);
 
-      // Create provider
       const provider = new ethers.BrowserProvider(ethereum);
       providerRef.current = provider;
 
-      // Get balance
       const balance = await provider.getBalance(accounts[0]);
 
       updateState({
@@ -114,14 +97,26 @@ export function useWeb3(): UseWeb3Return {
         error: null,
       });
     } catch (err) {
-      const error = DeployerError.fromError(err, "EVM");
-      updateState({ error });
+      let errorMessage = "Connection failed";
+
+      if (err instanceof Error) {
+        const msg = err.message.toLowerCase();
+        if (msg.includes("user rejected") || msg.includes("user denied")) {
+          errorMessage = "Connection rejected by user";
+        } else if (msg.includes("already pending")) {
+          errorMessage =
+            "Connection request already pending. Check your wallet.";
+        } else {
+          errorMessage = err.message;
+        }
+      }
+
+      updateState({ error: errorMessage });
     } finally {
       updateState({ isConnecting: false });
     }
   }, [getEthereum, updateState]);
 
-  // Disconnect
   const disconnect = useCallback(() => {
     providerRef.current = null;
     updateState({
@@ -134,7 +129,6 @@ export function useWeb3(): UseWeb3Return {
     });
   }, [updateState]);
 
-  // Switch network
   const switchNetwork = useCallback(
     async (chain: ChainConfig): Promise<boolean> => {
       const ethereum = getEthereum();
@@ -149,7 +143,6 @@ export function useWeb3(): UseWeb3Return {
       } catch (switchError) {
         const error = switchError as { code?: number };
 
-        // Chain not added - try to add it
         if (error.code === 4902) {
           try {
             await ethereum.request({
@@ -158,12 +151,12 @@ export function useWeb3(): UseWeb3Return {
                 {
                   chainId: chain.hexChainId,
                   chainName: chain.name,
-                  rpcUrls: chain.rpcUrls,
-                  blockExplorerUrls: chain.blockExplorers.map((e) => e.url),
+                  rpcUrls: [chain.rpcUrl],
+                  blockExplorerUrls: [chain.blockExplorer],
                   nativeCurrency: {
-                    name: chain.nativeCurrency.name,
-                    symbol: chain.nativeCurrency.symbol,
-                    decimals: chain.nativeCurrency.decimals,
+                    name: chain.currency,
+                    symbol: chain.currency,
+                    decimals: 18,
                   },
                 },
               ],
@@ -171,28 +164,14 @@ export function useWeb3(): UseWeb3Return {
             return true;
           } catch (addError) {
             updateState({
-              error: new DeployerError({
-                code: ErrorCode.NETWORK_SWITCH_FAILED,
-                message: "Failed to add network",
-                userMessage: `Could not add ${chain.name} to your wallet`,
-                suggestion:
-                  "Try adding the network manually in your wallet settings",
-                recoverable: true,
-                originalError: addError,
-              }),
+              error: `Could not add ${chain.name} to your wallet`,
             });
             return false;
           }
         }
 
         updateState({
-          error: new DeployerError({
-            code: ErrorCode.NETWORK_SWITCH_FAILED,
-            message: "Failed to switch network",
-            userMessage: `Could not switch to ${chain.name}`,
-            recoverable: true,
-            originalError: switchError,
-          }),
+          error: `Could not switch to ${chain.name}`,
         });
         return false;
       }
@@ -200,7 +179,6 @@ export function useWeb3(): UseWeb3Return {
     [getEthereum, updateState]
   );
 
-  // Check if on correct network
   const isCorrectNetwork = useCallback(
     (targetChainId: number): boolean => {
       return state.chainId === targetChainId;
@@ -208,7 +186,6 @@ export function useWeb3(): UseWeb3Return {
     [state.chainId]
   );
 
-  // Format balance with decimals
   const formatBalance = useCallback(
     (decimals: number = 4): string => {
       if (!state.balance) return "0";
@@ -218,7 +195,6 @@ export function useWeb3(): UseWeb3Return {
     [state.balance]
   );
 
-  // Set up event listeners
   useEffect(() => {
     const ethereum = getEthereum();
     if (!ethereum) return;
@@ -270,7 +246,12 @@ export function useWeb3(): UseWeb3Return {
   ]);
 
   return {
-    ...state,
+    account: state.account,
+    chainId: state.chainId,
+    isConnecting: state.isConnecting,
+    isConnected: state.isConnected,
+    error: state.error,
+    balance: state.balance,
     connect,
     disconnect,
     switchNetwork,

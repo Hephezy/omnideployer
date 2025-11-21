@@ -29,6 +29,7 @@ export default function OmniDeployer() {
   const [isDeploying, setIsDeploying] = useState(false);
   const [deployedAddress, setDeployedAddress] = useState<string | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
+  const [deployedTxHash, setDeployedTxHash] = useState<string | null>(null);
 
   const addLog = (msg: string) => setLogs(prev => [...prev, msg]);
 
@@ -44,6 +45,7 @@ export default function OmniDeployer() {
 
     setIsDeploying(true);
     setLogs([]);
+    setDeployedTxHash(null);
 
     try {
       addLog(`Initiating deployment on ${selectedChain.name}...`);
@@ -55,27 +57,71 @@ export default function OmniDeployer() {
       addLog(`Compiling Contract Factory...`);
       const factory = new ethers.ContractFactory(TOKEN_ABI, TOKEN_BYTECODE, signer);
 
-      // 3. Deploy Transaction
-      addLog(`Requesting signature...`);
-      const contract = await factory.deploy(config.name, config.symbol, config.supply);
+      // 3. Estimate gas before deployment
+      addLog(`Estimating gas...`);
+      const deployTx = await factory.getDeployTransaction(
+        config.name,
+        config.symbol,
+        config.supply
+      );
 
-      addLog(`Transaction broadcasted! Hash: ${contract.deploymentTransaction()?.hash}`);
+      const estimatedGas = await provider.estimateGas({
+        ...deployTx,
+        from: account
+      });
+
+      addLog(`Estimated gas: ${estimatedGas.toString()}`);
+
+      // 4. Deploy Transaction
+      addLog(`Requesting signature...`);
+      const contract = await factory.deploy(
+        config.name,
+        config.symbol,
+        config.supply,
+        {
+          gasLimit: estimatedGas * BigInt(120) / BigInt(100) // 20% buffer
+        }
+      );
+
+      const txHash = contract.deploymentTransaction()?.hash;
+      if (txHash) {
+        setDeployedTxHash(txHash);
+        addLog(`Transaction broadcasted! Hash: ${txHash}`);
+      }
+
       addLog(`Waiting for confirmations...`);
 
-      await contract.waitForDeployment();
+      // Wait for deployment with timeout
+      const deploymentPromise = contract.waitForDeployment();
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Deployment timeout after 120s')), 120000)
+      );
+
+      await Promise.race([deploymentPromise, timeoutPromise]);
 
       const address = await contract.getAddress();
       addLog(`SUCCESS! Contract deployed at: ${address}`);
       setDeployedAddress(address);
 
     } catch (err) {
-      console.error(err);
+      console.error('Deployment error:', err);
+
       let errorMessage = "Deployment failed";
       if (err instanceof Error) {
-        errorMessage = err.message;
+        // Parse common error types
+        if (err.message.includes('user rejected')) {
+          errorMessage = "Transaction rejected by user";
+        } else if (err.message.includes('insufficient funds')) {
+          errorMessage = `Insufficient ${selectedChain.currency} for gas`;
+        } else if (err.message.includes('nonce')) {
+          errorMessage = "Nonce error - please reset your wallet or wait";
+        } else {
+          errorMessage = err.message;
+        }
       } else if (typeof err === "object" && err !== null && "reason" in err) {
         errorMessage = (err as { reason: string }).reason;
       }
+
       addLog(`ERROR: ${errorMessage}`);
     } finally {
       setIsDeploying(false);
@@ -84,6 +130,7 @@ export default function OmniDeployer() {
 
   const reset = () => {
     setDeployedAddress(null);
+    setDeployedTxHash(null);
     setLogs([]);
     setConfig({ name: '', symbol: '', supply: 1000000, devAllocation: 100 });
   };
@@ -143,6 +190,7 @@ export default function OmniDeployer() {
             config={config}
             chain={selectedChain}
             contractAddress={deployedAddress}
+            txHash={deployedTxHash ?? undefined}
             onReset={reset}
           />
         ) : (

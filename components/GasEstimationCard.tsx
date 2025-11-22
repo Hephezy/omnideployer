@@ -1,6 +1,6 @@
 import { Card } from "./ui/Card";
 import { GasEstimation } from "@/hooks/useGasEstimation";
-import { Fuel, RefreshCw, TrendingUp, Clock, AlertCircle } from "lucide-react";
+import { Fuel, RefreshCw, Clock, AlertCircle } from "lucide-react";
 import { cn } from "@/utils";
 import { ethers } from "ethers";
 
@@ -12,8 +12,6 @@ interface GasEstimationCardProps {
   onRefresh: () => void;
   currency: string;
 }
-
-const date = Date.now();
 
 export const GasEstimationCard = ({
   estimation,
@@ -27,11 +25,11 @@ export const GasEstimationCard = ({
     return `${parseFloat(ethers.formatUnits(wei, "gwei")).toFixed(2)} Gwei`;
   };
 
-
-
+  // FIXED: Use dynamic Date.now() instead of static module-level constant
   const getTimeSinceUpdate = (): string => {
     if (!lastUpdated) return "";
-    const seconds = Math.floor((date - lastUpdated) / 1000);
+    const now = Date.now();
+    const seconds = Math.floor((now - lastUpdated) / 1000);
     if (seconds < 5) return "Just now";
     if (seconds < 60) return `${seconds}s ago`;
     return `${Math.floor(seconds / 60)}m ago`;

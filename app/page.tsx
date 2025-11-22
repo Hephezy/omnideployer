@@ -1,400 +1,350 @@
 "use client";
 
+import { useState, useEffect, useCallback } from "react";
 import { TerminalLog } from "@/components/TerminalLog";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
-import { Input } from "@/components/ui/Input";
+import { Input, NumberInput, Textarea } from "@/components/ui/Input";
 import { Slider } from "@/components/ui/Slider";
-import { GasEstimationCard } from "@/components/GasEstimationCard";
-import { NetworkStatusBadge, NetworkStatusIndicator } from "@/components/NetworkStatusBadge";
-import { DeploymentHistory } from "@/components/DeploymentHistory";
-import { WalletSelector, WalletButton } from "@/components/WalletSelector";
-import { ChainConfig, CHAINS, TOKEN_ABI } from "@/config/constants";
-import { ERC20_BYTECODE } from "@/config/contracts/erc20";
-import { ChainSelector } from "@/features/ChainSelector";
+import { DeploymentProgress } from "@/components/DeploymentProgress";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
+import { TokenValidation, useTokenValidation } from "@/components/TokenValidation";
+import { UnifiedWalletConnect } from "@/features/UnifiedWalletConnect";
 import { SuccessView } from "@/features/SuccessView";
-import { useMultiWallet } from "@/hooks/useMultiWallet";
-import { useGasEstimation } from "@/hooks/useGasEstimation";
-import { useNetworkStatus } from "@/hooks/useNetworkStatus";
-import { useDeploymentHistory } from "@/hooks/useDeploymentHistory";
-import { ethers } from "ethers";
-import { Rocket, Settings, ShieldCheck, History, Fuel } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useMultiChain } from "@/contexts/MultiChainContext";
+import { DeploymentStep } from "@/types";
+import { Rocket, Settings, ShieldCheck, Coins, ArrowLeft } from "lucide-react";
+import { formatCompact } from "@/utils";
 
 export default function OmniDeployer() {
-  // Multi-wallet support
+  // Use the Multi-Chain Context instead of EVM-specific hooks
   const {
-    account,
-    chainId,
-    isConnecting,
-    isConnected,
-    activeWallet,
-    error: walletError,
+    activeChainType,
+    wallet,
     balance,
-    availableWallets,
-    connect,
+    activeAdapter,
     disconnect,
-    switchNetwork,
-  } = useMultiWallet();
+    deployToken,
+    estimateDeployFee,
+    isDeploying: isAdapterDeploying,
+    error: adapterError,
+    clearError
+  } = useMultiChain();
 
   // State
-  const [selectedChain, setSelectedChain] = useState<ChainConfig | null>(null);
   const [config, setConfig] = useState({
     name: "",
     symbol: "",
     supply: 1000000,
+    decimals: 9, // Default varies by chain, handled in effect
+    description: "",
     devAllocation: 100,
   });
-  const [isDeploying, setIsDeploying] = useState(false);
-  const [deployedAddress, setDeployedAddress] = useState<string | null>(null);
+
   const [logs, setLogs] = useState<string[]>([]);
-  const [deployedTxHash, setDeployedTxHash] = useState<string | null>(null);
-  const [showWalletModal, setShowWalletModal] = useState(false);
+  const [deploymentState, setDeploymentState] = useState<{
+    step: DeploymentStep;
+    txHash: string | null;
+    contractAddress: string | null;
+    error: string | null;
+  }>({
+    step: "idle",
+    txHash: null,
+    contractAddress: null,
+    error: null
+  });
 
-  // Gas estimation
-  const {
-    estimation: gasEstimation,
-    isEstimating: isEstimatingGas,
-    error: gasError,
-    lastUpdated: gasLastUpdated,
-    refresh: refreshGas,
-  } = useGasEstimation(selectedChain, account, config);
+  const [estimatedFee, setEstimatedFee] = useState<string | null>(null);
+  const [isFeeLoading, setIsFeeLoading] = useState(false);
 
-  // Network status
-  const { status: networkStatus, isChecking: isCheckingNetwork, checkNow: checkNetwork } = useNetworkStatus(selectedChain);
+  // Token validation
+  const { errors: validationErrors, isValid, validate } = useTokenValidation();
 
-  // Deployment history
-  const {
-    history,
-    addDeployment,
-    removeDeployment,
-    clearHistory,
-    markVerified,
-  } = useDeploymentHistory();
+  const addLog = useCallback((msg: string) => {
+    setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
+  }, []);
 
-  const addLog = (msg: string) => setLogs((prev) => [...prev, msg]);
+  // Update decimals based on chain type
+  useEffect(() => {
+    if (!activeChainType) return;
+    const defaults = {
+      evm: 18,
+      solana: 9,
+      aptos: 8,
+      sui: 9
+    };
+    setConfig(prev => ({ ...prev, decimals: defaults[activeChainType] }));
+  }, [activeChainType]);
+
+  // Estimate fees when config changes
+  useEffect(() => {
+    const estimate = async () => {
+      if (!isValid || !activeAdapter || !wallet) return;
+
+      setIsFeeLoading(true);
+      try {
+        const estimate = await estimateDeployFee({
+          name: config.name,
+          symbol: config.symbol,
+          decimals: config.decimals,
+          initialSupply: config.supply,
+          description: config.description
+        });
+        setEstimatedFee(`${estimate.estimatedFee} ${estimate.feeToken}`);
+      } catch (e) {
+        console.error("Fee estimation failed", e);
+      } finally {
+        setIsFeeLoading(false);
+      }
+    };
+
+    const debounce = setTimeout(estimate, 800);
+    return () => clearTimeout(debounce);
+  }, [config, activeAdapter, wallet, isValid, estimateDeployFee]);
 
   const handleDeploy = async () => {
-    if (!selectedChain || !account || !window.ethereum) return;
+    if (!activeAdapter || !wallet) return;
 
-    if (chainId !== selectedChain.chainId) {
-      addLog(`Switching to ${selectedChain.name}...`);
-      const switched = await switchNetwork(selectedChain.hexChainId, {
-        chainId: selectedChain.hexChainId,
-        chainName: selectedChain.name,
-        rpcUrls: [selectedChain.rpcUrl],
-        blockExplorerUrls: [selectedChain.blockExplorer],
-        nativeCurrency: { name: selectedChain.currency, symbol: selectedChain.currency, decimals: 18 },
-      });
-      if (!switched) {
-        addLog("ERROR: Failed to switch network");
-        return;
-      }
+    // Validate
+    const validationResult = validate(config);
+    if (!validationResult.isValid) {
+      addLog(`ERROR: ${validationResult.errors[0].message}`);
+      return;
     }
 
-    setIsDeploying(true);
+    setDeploymentState({ step: "preparing", txHash: null, contractAddress: null, error: null });
     setLogs([]);
-    setDeployedTxHash(null);
+
+    addLog(`Initiating deployment on ${activeChainType}...`);
+    addLog(`Token: ${config.name} (${config.symbol})`);
 
     try {
-      addLog(`Initiating deployment on ${selectedChain.name}...`);
+      setDeploymentState(prev => ({ ...prev, step: "signing" }));
+      addLog("Please confirm transaction in wallet...");
 
-      const provider = new ethers.BrowserProvider(window.ethereum);
-      const signer = await provider.getSigner();
-
-      addLog(`Compiling Contract Factory...`);
-      const factory = new ethers.ContractFactory(TOKEN_ABI, ERC20_BYTECODE, signer);
-
-      addLog(`Estimating gas...`);
-      const deployTx = await factory.getDeployTransaction(config.name, config.symbol, config.supply);
-      const estimatedGas = await provider.estimateGas({ ...deployTx, from: account });
-      addLog(`Estimated gas: ${estimatedGas.toString()}`);
-
-      addLog(`Requesting signature...`);
-      const contract = await factory.deploy(config.name, config.symbol, config.supply, {
-        gasLimit: (estimatedGas * BigInt(120)) / BigInt(100),
+      const result = await deployToken({
+        name: config.name,
+        symbol: config.symbol,
+        decimals: config.decimals,
+        initialSupply: config.supply,
+        description: config.description
       });
 
-      const txHash = contract.deploymentTransaction()?.hash;
-      if (txHash) {
-        setDeployedTxHash(txHash);
-        addLog(`Transaction broadcasted! Hash: ${txHash}`);
+      if (result.success) {
+        setDeploymentState({
+          step: "success",
+          txHash: result.transactionHash,
+          contractAddress: result.contractAddress || result.tokenMint || result.packageId || "",
+          error: null
+        });
+        addLog("✅ Deployment Successful!");
+        addLog(`Hash: ${result.transactionHash}`);
+      } else {
+        throw new Error(result.error || "Unknown deployment error");
       }
 
-      addLog(`Waiting for confirmations...`);
-
-      await Promise.race([
-        contract.waitForDeployment(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 120000)),
-      ]);
-
-      const address = await contract.getAddress();
-      addLog(`SUCCESS! Contract deployed at: ${address}`);
-      setDeployedAddress(address);
-
-      // Add to history
-      addDeployment({
-        chainId: selectedChain.chainId,
-        chainName: selectedChain.name,
-        tokenName: config.name,
-        tokenSymbol: config.symbol,
-        totalSupply: config.supply,
-        contractAddress: address,
-        txHash: txHash || "",
-        deployer: account,
-        explorerUrl: `${selectedChain.blockExplorer}/address/${address}`,
-        verified: false,
-        status: "success",
-      });
     } catch (err) {
-      console.error("Deployment error:", err);
-      let errorMessage = "Deployment failed";
-      if (err instanceof Error) {
-        if (err.message.includes("user rejected")) errorMessage = "Transaction rejected";
-        else if (err.message.includes("insufficient funds")) errorMessage = `Insufficient ${selectedChain.currency}`;
-        else if (err.message.includes("nonce")) errorMessage = "Nonce error - try again";
-        else errorMessage = err.message;
-      }
-      addLog(`ERROR: ${errorMessage}`);
-    } finally {
-      setIsDeploying(false);
+      const msg = err instanceof Error ? err.message : "Deployment failed";
+      setDeploymentState(prev => ({ ...prev, step: "error", error: msg }));
+      addLog(`❌ ERROR: ${msg}`);
     }
   };
 
   const reset = () => {
-    setDeployedAddress(null);
-    setDeployedTxHash(null);
+    setDeploymentState({ step: "idle", txHash: null, contractAddress: null, error: null });
+    setConfig({ name: "", symbol: "", supply: 1000000, decimals: 9, description: "", devAllocation: 100 });
     setLogs([]);
-    setConfig({ name: "", symbol: "", supply: 1000000, devAllocation: 100 });
+    clearError();
   };
 
+  // Validate on config change
   useEffect(() => {
-    if (chainId && !selectedChain) {
-      const match = CHAINS.find((c) => c.chainId === chainId);
-      if (match) setSelectedChain(match);
-    }
-  }, [chainId, selectedChain]);
+    if (config.name || config.symbol) validate(config);
+  }, [config, validate]);
+
+  const canDeploy = isValid && !isAdapterDeploying && wallet && activeChainType;
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-200 font-sans selection:bg-cyan-500/30 relative overflow-hidden">
-      {/* Background */}
-      <div className="fixed inset-0 z-0 pointer-events-none">
-        <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] rounded-full bg-cyan-900/10 blur-[120px]" />
-        <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] rounded-full bg-purple-900/10 blur-[120px]" />
+    <ErrorBoundary>
+      <div className="min-h-screen bg-slate-950 text-slate-200 font-sans selection:bg-cyan-500/30 relative overflow-hidden">
+        {/* Background */}
+        <div className="fixed inset-0 z-0 pointer-events-none">
+          <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] rounded-full bg-cyan-900/10 blur-[120px]" />
+          <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] rounded-full bg-purple-900/10 blur-[120px]" />
+        </div>
+
+        {/* Header */}
+        <header className="relative z-10 border-b border-slate-800/60 bg-slate-950/50 backdrop-blur-md sticky top-0">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
+            <div className="flex items-center gap-2 cursor-pointer" onClick={reset}>
+              <div className="w-8 h-8 bg-linear-to-br from-cyan-500 to-blue-600 rounded-lg flex items-center justify-center text-white font-bold text-sm">OD</div>
+              <span className="text-lg font-bold hidden sm:inline">Omni<span className="text-cyan-400">Check</span></span>
+            </div>
+
+            {wallet && (
+              <div className="flex items-center gap-4">
+                <div className="hidden sm:block text-right">
+                  <p className="text-xs text-slate-500">Connected to {activeChainType?.toUpperCase()}</p>
+                  <p className="text-sm font-mono text-cyan-400">{balance?.formatted || "0.00"} {balance?.symbol}</p>
+                </div>
+                <Button variant="outline" onClick={disconnect} className="text-xs">Disconnect</Button>
+              </div>
+            )}
+          </div>
+        </header>
+
+        <main className="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 py-8 sm:py-12">
+          {/* Wallet Connection / Chain Selection View */}
+          {!wallet ? (
+            <UnifiedWalletConnect />
+          ) : deploymentState.contractAddress ? (
+            // Success View
+            <SuccessView
+              config={config}
+              chain={null} // We can adapt SuccessView to accept generic chain info later
+              contractAddress={deploymentState.contractAddress}
+              txHash={deploymentState.txHash || undefined}
+              onReset={reset}
+            />
+          ) : (
+            // Deployment Form
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 lg:gap-8">
+              <div className="lg:col-span-7 space-y-6">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                    <Settings className="w-5 h-5 text-cyan-400" />
+                    Token Configuration
+                  </h2>
+                  <span className="px-3 py-1 rounded-full bg-slate-800 text-xs text-slate-400 border border-slate-700 uppercase tracking-wider">
+                    {activeChainType} Network
+                  </span>
+                </div>
+
+                <div className="space-y-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <Input
+                      label="Token Name"
+                      placeholder="e.g. Omni Token"
+                      value={config.name}
+                      onChange={(v) => setConfig({ ...config, name: v })}
+                      disabled={isAdapterDeploying}
+                    />
+                    <Input
+                      label="Symbol"
+                      placeholder="e.g. OMNI"
+                      value={config.symbol}
+                      onChange={(v) => setConfig({ ...config, symbol: v.toUpperCase().slice(0, 10) })}
+                      disabled={isAdapterDeploying}
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <NumberInput
+                      label="Total Supply"
+                      value={config.supply}
+                      onChange={(v) => setConfig({ ...config, supply: Number(v) })}
+                      min={1}
+                      disabled={isAdapterDeploying}
+                    />
+                    <Input
+                      label="Decimals"
+                      type="number"
+                      value={config.decimals}
+                      onChange={(v) => setConfig({ ...config, decimals: Number(v) })}
+                      disabled={true} // Typically fixed per chain standard, but can be editable
+                      hint={`Standard for ${activeChainType}`}
+                    />
+                  </div>
+
+                  {/* Non-EVM chains often support description/metadata on-chain */}
+                  {activeChainType !== 'evm' && (
+                    <Textarea
+                      label="Description"
+                      placeholder="Describe your token..."
+                      value={config.description}
+                      onChange={(v) => setConfig({ ...config, description: v })}
+                      maxLength={200}
+                    />
+                  )}
+
+                  <TokenValidation errors={validationErrors} />
+
+                  <div className="p-5 rounded-xl border border-slate-800 bg-slate-900/30 space-y-4">
+                    <Slider
+                      label="Dev Allocation"
+                      value={config.devAllocation}
+                      onChange={(v) => setConfig({ ...config, devAllocation: v })}
+                      disabled={isAdapterDeploying}
+                    />
+                    <p className="text-xs text-slate-500 italic">
+                      Minting <span className="text-cyan-400 font-mono">{((config.supply * config.devAllocation) / 100).toLocaleString()}</span> {config.symbol || "TOKENS"} to your wallet.
+                    </p>
+                  </div>
+                </div>
+
+                {/* Fees & Actions */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <Card className="p-4 bg-slate-900/50 border-slate-800 flex flex-col justify-center">
+                    <span className="text-xs text-slate-500 uppercase tracking-wider mb-1">Estimated Network Fee</span>
+                    {isFeeLoading ? (
+                      <span className="text-sm text-slate-400 animate-pulse">Calculating...</span>
+                    ) : (
+                      <span className="text-lg font-mono text-white">{estimatedFee || "---"}</span>
+                    )}
+                  </Card>
+
+                  <Button
+                    onClick={handleDeploy}
+                    disabled={!canDeploy}
+                    isLoading={isAdapterDeploying}
+                    className="h-full min-h-[60px] text-base"
+                  >
+                    <Rocket className="w-5 h-5 mr-2" />
+                    {isAdapterDeploying ? "Deploying..." : "Deploy Token"}
+                  </Button>
+                </div>
+
+                {/* Progress */}
+                <DeploymentProgress
+                  currentStep={deploymentState.step}
+                  txHash={deploymentState.txHash}
+                  errorMessage={deploymentState.error || adapterError || undefined}
+                />
+              </div>
+
+              {/* Preview Column */}
+              <div className="lg:col-span-5 space-y-6">
+                <Card className="p-6 bg-slate-950 border-slate-800 sticky top-24">
+                  <div className="flex justify-between items-start mb-6">
+                    <div>
+                      <h3 className="text-xs font-bold text-slate-500 uppercase mb-1">Preview</h3>
+                      <div className="text-2xl font-bold text-white">{config.name || "Token Name"}</div>
+                      <div className="text-sm text-cyan-400 font-mono mt-1">${config.symbol || "SYMB"}</div>
+                    </div>
+                    <Coins className="w-8 h-8 text-slate-700" />
+                  </div>
+                  <div className="space-y-3 text-sm border-t border-slate-800/50 pt-4">
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Ecosystem</span>
+                      <span className="text-slate-300 capitalize">{activeChainType}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Supply</span>
+                      <span className="text-slate-300 font-mono">{formatCompact(config.supply)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Decimals</span>
+                      <span className="text-slate-300">{config.decimals}</span>
+                    </div>
+                  </div>
+                </Card>
+
+                <TerminalLog logs={logs} />
+              </div>
+            </div>
+          )}
+        </main>
       </div>
-
-      {/* Header */}
-      <header className="relative z-10 border-b border-slate-800/60 bg-slate-950/50 backdrop-blur-md sticky top-0">
-        <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2 group cursor-pointer" onClick={reset}>
-            <div className="w-8 h-8 bg-gradient-to-br from-cyan-500 to-blue-600 rounded-lg flex items-center justify-center text-white font-bold">
-              OD
-            </div>
-            <span className="text-lg font-bold">
-              Omni<span className="text-cyan-400">Deployer</span>
-            </span>
-          </div>
-
-          <div className="flex items-center gap-4">
-            {selectedChain && <NetworkStatusIndicator status={networkStatus} />}
-            <WalletButton
-              account={account}
-              activeWallet={activeWallet}
-              balance={balance}
-              onConnect={() => setShowWalletModal(true)}
-              onDisconnect={disconnect}
-              isConnecting={isConnecting}
-            />
-          </div>
-        </div>
-      </header>
-
-      {/* Wallet Modal */}
-      {showWalletModal && !account && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-          <Card className="w-full max-w-md p-6 m-4 bg-slate-900 border-slate-700">
-            <h2 className="text-xl font-bold mb-4">Connect Wallet</h2>
-            <WalletSelector
-              wallets={availableWallets}
-              activeWallet={activeWallet}
-              isConnecting={isConnecting}
-              error={walletError}
-              onConnect={(type) => {
-                connect(type);
-                if (!walletError) setShowWalletModal(false);
-              }}
-            />
-            <button
-              onClick={() => setShowWalletModal(false)}
-              className="mt-4 w-full py-2 text-slate-400 hover:text-white transition-colors"
-            >
-              Cancel
-            </button>
-          </Card>
-        </div>
-      )}
-
-      {/* Main Content */}
-      <main className="relative z-10 max-w-7xl mx-auto px-6 py-12">
-        {!account ? (
-          <div className="flex flex-col items-center justify-center min-h-[400px] space-y-6">
-            <div className="text-center space-y-2">
-              <h2 className="text-2xl font-bold">Welcome to OmniDeployer</h2>
-              <p className="text-slate-400">Connect your wallet to deploy tokens</p>
-            </div>
-            <Button onClick={() => setShowWalletModal(true)} className="px-8 py-3 text-lg">
-              Connect Wallet
-            </Button>
-          </div>
-        ) : deployedAddress ? (
-          <SuccessView
-            config={config}
-            chain={selectedChain}
-            contractAddress={deployedAddress}
-            txHash={deployedTxHash ?? undefined}
-            onReset={reset}
-          />
-        ) : (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-            {/* LEFT COLUMN */}
-            <div className="lg:col-span-7 space-y-6">
-              <ChainSelector
-                selected={selectedChain}
-                currentChainId={chainId}
-                onSelect={setSelectedChain}
-                onSwitch={(chain) =>
-                  switchNetwork(chain.hexChainId, {
-                    chainId: chain.hexChainId,
-                    chainName: chain.name,
-                    rpcUrls: [chain.rpcUrl],
-                    blockExplorerUrls: [chain.blockExplorer],
-                    nativeCurrency: { name: chain.currency, symbol: chain.currency, decimals: 18 },
-                  })
-                }
-              />
-
-              {/* Network Status */}
-              {selectedChain && (
-                <NetworkStatusBadge
-                  status={networkStatus}
-                  isChecking={isCheckingNetwork}
-                  onRefresh={checkNetwork}
-                  showDetails
-                />
-              )}
-
-              {/* Token Config */}
-              <section className="space-y-4">
-                <div className="flex items-center gap-2 text-purple-400 mt-6">
-                  <Settings className="w-4 h-4" />
-                  <span className="text-xs font-bold tracking-widest uppercase">Token Configuration</span>
-                </div>
-
-                <div className="grid grid-cols-2 gap-4">
-                  <Input
-                    label="Token Name"
-                    placeholder="e.g. Galactic Credits"
-                    value={config.name}
-                    onChange={(v) => setConfig({ ...config, name: v })}
-                    disabled={isDeploying}
-                  />
-                  <Input
-                    label="Symbol"
-                    placeholder="e.g. CRED"
-                    value={config.symbol}
-                    onChange={(v) => setConfig({ ...config, symbol: v.toUpperCase() })}
-                    disabled={isDeploying}
-                  />
-                </div>
-
-                <Input
-                  label="Total Supply"
-                  type="number"
-                  placeholder="1000000"
-                  value={config.supply}
-                  onChange={(v) => setConfig({ ...config, supply: parseInt(v) || 0 })}
-                  disabled={isDeploying}
-                />
-
-                <div className="p-5 rounded-xl border border-slate-800 bg-slate-900/30 space-y-4">
-                  <Slider
-                    label="Dev Allocation"
-                    value={config.devAllocation}
-                    onChange={(v) => setConfig({ ...config, devAllocation: v })}
-                    disabled={isDeploying}
-                  />
-                  <p className="text-xs text-slate-500 italic">
-                    Minting {((config.supply * config.devAllocation) / 100).toLocaleString()}{" "}
-                    {config.symbol || "TOKENS"} to your wallet.
-                  </p>
-                </div>
-              </section>
-
-              {/* Gas Estimation */}
-              <GasEstimationCard
-                estimation={gasEstimation}
-                isEstimating={isEstimatingGas}
-                error={gasError}
-                lastUpdated={gasLastUpdated}
-                onRefresh={refreshGas}
-                currency={selectedChain?.currency || "ETH"}
-              />
-
-              {/* Deploy Button */}
-              <Button
-                onClick={handleDeploy}
-                disabled={!selectedChain || !config.name || !config.symbol || isDeploying}
-                isLoading={isDeploying}
-                className="w-full py-4 text-base"
-              >
-                <Rocket className="w-5 h-5 mr-2" />
-                {isDeploying ? "Deploying..." : "Deploy Token"}
-              </Button>
-            </div>
-
-            {/* RIGHT COLUMN */}
-            <div className="lg:col-span-5 space-y-6">
-              {/* Preview Card */}
-              <Card className="p-6 bg-slate-950 border-slate-800">
-                <div className="flex justify-between items-start mb-6">
-                  <div>
-                    <h3 className="text-xs font-bold text-slate-500 uppercase mb-1">Preview</h3>
-                    <div className="text-2xl font-bold text-white">{config.name || "Token Name"}</div>
-                    <div className="text-sm text-cyan-400 font-mono mt-1">${config.symbol || "SYMB"}</div>
-                  </div>
-                  <ShieldCheck className="w-8 h-8 text-slate-600" />
-                </div>
-                <div className="space-y-2 text-sm">
-                  <div className="flex justify-between">
-                    <span className="text-slate-500">Chain</span>
-                    <span className="text-slate-300">{selectedChain?.name || "Not Selected"}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-slate-500">Supply</span>
-                    <span className="text-slate-300 font-mono">{config.supply.toLocaleString()}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-slate-500">Standard</span>
-                    <span className="text-slate-300">ERC-20</span>
-                  </div>
-                </div>
-              </Card>
-
-              <TerminalLog logs={logs} />
-
-              <DeploymentHistory
-                history={history}
-                onRemove={removeDeployment}
-                onClear={clearHistory}
-              />
-            </div>
-          </div>
-        )}
-      </main>
-
-      <footer className="relative z-10 text-center py-8 text-slate-600 text-xs">
-        OmniDeployer v3.0 • Testnet Only
-      </footer>
-    </div>
+    </ErrorBoundary>
   );
 }

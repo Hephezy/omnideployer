@@ -34,6 +34,29 @@ export class EVMAdapter extends BaseChainAdapter {
     };
   }
 
+  /**
+   * Helper to fix "invalid BytesLike value" errors.
+   * Removes whitespace/newlines and ensures the string is valid hex.
+   */
+  private getCleanBytecode(): string {
+    // 1. Remove all whitespace (spaces, newlines, tabs)
+    let clean = ERC20_BYTECODE.replace(/\s/g, "");
+
+    // 2. Ensure it starts with 0x
+    if (!clean.startsWith("0x")) {
+      clean = "0x" + clean;
+    }
+
+    // 3. Validate length (do NOT pad automatically)
+    if (clean.length % 2 !== 0) {
+      throw new Error(
+        "Critical: ERC20 Bytecode has odd length. Please check erc20.ts file."
+      );
+    }
+
+    return clean;
+  }
+
   async connect(): Promise<WalletInfo> {
     if (!window.ethereum) {
       throw new Error("No Ethereum wallet found. Please install MetaMask.");
@@ -170,11 +193,15 @@ export class EVMAdapter extends BaseChainAdapter {
       throw new Error("Not connected");
     }
 
+    // Use the CLEAN bytecode
+    const bytecode = this.getCleanBytecode();
+
     const factory = new ethers.ContractFactory(
       ERC20_ABI,
-      ERC20_BYTECODE,
+      bytecode, // <--- Updated here
       this.signer
     );
+
     const deployTx = await factory.getDeployTransaction(
       params.name,
       params.symbol,
@@ -212,9 +239,12 @@ export class EVMAdapter extends BaseChainAdapter {
     }
 
     try {
+      // Use the CLEAN bytecode
+      const bytecode = this.getCleanBytecode();
+
       const factory = new ethers.ContractFactory(
         ERC20_ABI,
-        ERC20_BYTECODE,
+        bytecode, // <--- Updated here
         this.signer
       );
 

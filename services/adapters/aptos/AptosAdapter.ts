@@ -13,99 +13,69 @@ import {
   Aptos,
   AptosConfig,
   Network,
-  Account,
-  Ed25519PrivateKey,
   AccountAddress,
-  U64,
-  MoveString,
 } from "@aptos-labs/ts-sdk";
 
-// Petra wallet interface
-interface AptosWallet {
-  aptos?: {
-    connect(): Promise<{ address: string; publicKey: string }>;
-    disconnect(): Promise<void>;
-    isConnected(): Promise<boolean>;
-    account(): Promise<{ address: string; publicKey: string }>;
-    signAndSubmitTransaction(payload: any): Promise<{ hash: string }>;
-    signTransaction(payload: any): Promise<Uint8Array>;
-    onAccountChange(
-      callback: (account: { address: string } | null) => void
-    ): void;
-    onNetworkChange(callback: (network: { name: string }) => void): void;
-  };
-}
-
+// Correctly extend the global window interface for Petra/Martian
 declare global {
-  interface Window extends AptosWallet {}
+  interface Window {
+    aptos?: {
+      connect(): Promise<{ address: string; publicKey: string }>;
+      disconnect(): Promise<void>;
+      isConnected(): Promise<boolean>;
+      account(): Promise<{ address: string; publicKey: string }>;
+      signAndSubmitTransaction(payload: any): Promise<{ hash: string }>;
+      onAccountChange(
+        callback: (account: { address: string } | null) => void
+      ): void;
+      onNetworkChange(callback: (network: { name: string }) => void): void;
+    };
+  }
 }
 
 export class AptosAdapter extends BaseChainAdapter {
   readonly chainType = "aptos" as const;
   readonly chainInfo: ChainInfo;
-
   private aptos: Aptos;
 
   constructor(network: "mainnet" | "testnet" | "devnet" = "testnet") {
     super();
 
-    const networks = {
+    const networkConfig = {
       mainnet: {
-        id: "aptos-mainnet",
-        name: "Aptos Mainnet",
-        rpcUrl: "https://fullnode.mainnet.aptoslabs.com/v1",
-        explorerUrl: "https://explorer.aptoslabs.com",
-        isTestnet: false,
-        network: Network.MAINNET,
+        url: "https://fullnode.mainnet.aptoslabs.com/v1",
+        enum: Network.MAINNET,
       },
       testnet: {
-        id: "aptos-testnet",
-        name: "Aptos Testnet",
-        rpcUrl: "https://fullnode.testnet.aptoslabs.com/v1",
-        explorerUrl: "https://explorer.aptoslabs.com?network=testnet",
-        isTestnet: true,
-        network: Network.TESTNET,
+        url: "https://fullnode.testnet.aptoslabs.com/v1",
+        enum: Network.TESTNET,
       },
       devnet: {
-        id: "aptos-devnet",
-        name: "Aptos Devnet",
-        rpcUrl: "https://fullnode.devnet.aptoslabs.com/v1",
-        explorerUrl: "https://explorer.aptoslabs.com?network=devnet",
-        isTestnet: true,
-        network: Network.DEVNET,
+        url: "https://fullnode.devnet.aptoslabs.com/v1",
+        enum: Network.DEVNET,
       },
     };
 
-    const config = networks[network];
+    const config = networkConfig[network];
 
     this.chainInfo = {
-      id: config.id,
-      name: config.name,
+      id: `aptos-${network}`,
+      name: `Aptos ${network.charAt(0).toUpperCase() + network.slice(1)}`,
       type: "aptos",
-      isTestnet: config.isTestnet,
-      nativeCurrency: {
-        name: "Aptos",
-        symbol: "APT",
-        decimals: 8,
-      },
-      explorerUrl: config.explorerUrl,
-      rpcUrl: config.rpcUrl,
+      isTestnet: network !== "mainnet",
+      nativeCurrency: { name: "Aptos", symbol: "APT", decimals: 8 },
+      explorerUrl: `https://explorer.aptoslabs.com`,
+      rpcUrl: config.url,
     };
 
-    const aptosConfig = new AptosConfig({ network: config.network });
-    this.aptos = new Aptos(aptosConfig);
+    this.aptos = new Aptos(new AptosConfig({ network: config.enum }));
   }
 
   async connect(): Promise<WalletInfo> {
-    const petra = window.aptos;
-
-    if (!petra) {
-      throw new Error("Petra wallet not found. Please install Petra.");
-    }
+    if (!window.aptos) throw new Error("Petra wallet not found");
 
     try {
-      const response = await petra.connect();
-
+      const response = await window.aptos.connect();
       this.wallet = {
         address: response.address,
         publicKey: response.publicKey,
@@ -115,8 +85,7 @@ export class AptosAdapter extends BaseChainAdapter {
         walletName: "Petra",
       };
 
-      // Set up event listeners
-      petra.onAccountChange((account) => {
+      window.aptos.onAccountChange((account) => {
         if (account) {
           this.wallet = { ...this.wallet!, address: account.address };
           this.emit("accountChange", account.address);
@@ -125,89 +94,46 @@ export class AptosAdapter extends BaseChainAdapter {
         }
       });
 
-      petra.onNetworkChange((network) => {
-        this.emit("chainChange", network.name);
-      });
-
       return this.wallet;
     } catch (error) {
-      throw new Error(`Failed to connect to Petra: ${error}`);
+      throw new Error("Connection failed");
     }
   }
 
   async disconnect(): Promise<void> {
-    const petra = window.aptos;
-    if (petra) {
-      await petra.disconnect();
-    }
+    if (window.aptos) await window.aptos.disconnect();
     this.wallet = null;
     this.emit("disconnect");
   }
 
   async getBalance(address?: string): Promise<TokenBalance> {
-    const accountAddress = AccountAddress.from(
-      address || this.wallet?.address || ""
-    );
+    const addr = address || this.wallet?.address;
+    if (!addr) return { raw: "0", formatted: "0", symbol: "APT", decimals: 8 };
 
     try {
-      const resources = await this.aptos.getAccountResources({
-        accountAddress,
+      const resource = await this.aptos.getAccountCoinAmount({
+        accountAddress: addr,
+        coinType: "0x1::aptos_coin::AptosCoin",
       });
 
-      const aptResource = resources.find(
-        (r) => r.type === "0x1::coin::CoinStore<0x1::aptos_coin::AptosCoin>"
-      );
-
-      const balance = aptResource
-        ? BigInt((aptResource.data as any).coin.value)
-        : BigInt(0);
-
       return {
-        raw: balance,
-        formatted: (Number(balance) / 1e8).toFixed(4),
+        raw: BigInt(resource),
+        formatted: (resource / 1e8).toFixed(4),
         symbol: "APT",
         decimals: 8,
       };
     } catch {
-      return {
-        raw: BigInt(0),
-        formatted: "0",
-        symbol: "APT",
-        decimals: 8,
-      };
+      return { raw: "0", formatted: "0", symbol: "APT", decimals: 8 };
     }
-  }
-
-  isValidAddress(address: string): boolean {
-    try {
-      // Aptos addresses are 64 hex characters with 0x prefix
-      if (!address.startsWith("0x")) return false;
-      if (address.length !== 66) return false;
-      AccountAddress.from(address);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  async estimateDeploymentFee(params: TokenDeployParams): Promise<GasEstimate> {
-    // Aptos coin deployment typically costs around 0.01-0.05 APT
-    return {
-      estimatedFee: "0.05",
-      feeToken: "APT",
-      gasUnits: BigInt(50000),
-    };
   }
 
   async deployToken(params: TokenDeployParams): Promise<DeployResult> {
-    if (!this.wallet || !window.aptos) {
-      throw new Error("Wallet not connected");
-    }
+    if (!this.wallet || !window.aptos) throw new Error("Wallet not connected");
 
     try {
-      // Note: Deploying a custom coin on Aptos requires publishing a Move module
-      // This is a simplified example using the managed_coin module
-
+      // Note: True asset creation on Aptos uses 0x1::managed_coin (if published)
+      // or requires publishing a package.
+      // This payload attempts to initialize a managed coin.
       const payload = {
         type: "entry_function_payload",
         function: "0x1::managed_coin::initialize",
@@ -218,44 +144,50 @@ export class AptosAdapter extends BaseChainAdapter {
           params.name,
           params.symbol,
           params.decimals || 8,
-          true, // monitor_supply
+          false, // monitor_supply
         ],
       };
 
       const response = await window.aptos.signAndSubmitTransaction(payload);
-
-      // Wait for transaction
-      await this.aptos.waitForTransaction({
-        transactionHash: response.hash,
-      });
+      await this.aptos.waitForTransaction({ transactionHash: response.hash });
 
       return {
         success: true,
         transactionHash: response.hash,
-        coinType: `${this.wallet.address}::${params.symbol}::${params.symbol}`,
-        explorerUrl: this.getExplorerUrl(response.hash, "tx"),
+        explorerUrl: `${this.chainInfo.explorerUrl}/txn/${
+          response.hash
+        }?network=${this.chainInfo.id.split("-")[1]}`,
       };
-    } catch (error) {
+    } catch (error: any) {
       return {
         success: false,
         transactionHash: "",
         explorerUrl: "",
-        error: error instanceof Error ? error.message : "Deployment failed",
+        error: error.message,
       };
     }
   }
 
-  async waitForTransaction(hash: string): Promise<TransactionReceipt> {
-    const result = await this.aptos.waitForTransaction({
-      transactionHash: hash,
-    });
+  async estimateDeploymentFee(params: TokenDeployParams): Promise<GasEstimate> {
+    return { estimatedFee: "0.005", feeToken: "APT" };
+  }
 
-    return {
-      hash,
-      status: result.success ? "success" : "failed",
-      confirmations: 1,
-      gasUsed: result.gas_used?.toString(),
-    };
+  isValidAddress(address: string): boolean {
+    try {
+      return AccountAddress.isValid({ input: address }).valid;
+    } catch {
+      return false;
+    }
+  }
+
+  formatAddress(address: string): string {
+    if (!address) return "";
+    return `${address.slice(0, 6)}...${address.slice(-4)}`;
+  }
+
+  async waitForTransaction(hash: string): Promise<TransactionReceipt> {
+    await this.aptos.waitForTransaction({ transactionHash: hash });
+    return { hash, status: "success", confirmations: 1 };
   }
 
   async getTransactionStatus(hash: string): Promise<TransactionReceipt> {
@@ -263,25 +195,9 @@ export class AptosAdapter extends BaseChainAdapter {
       const tx = await this.aptos.getTransactionByHash({
         transactionHash: hash,
       });
-
-      return {
-        hash,
-        status: (tx as any).success ? "success" : "failed",
-        confirmations: 1,
-        gasUsed: (tx as any).gas_used?.toString(),
-      };
+      return { hash, status: "success", confirmations: 1 };
     } catch {
-      return {
-        hash,
-        status: "pending",
-        confirmations: 0,
-      };
+      return { hash, status: "pending", confirmations: 0 };
     }
-  }
-
-  getExplorerUrl(hash: string, type: "tx" | "address" | "token"): string {
-    const network = this.chainInfo.isTestnet ? "?network=testnet" : "";
-    const paths = { tx: "/txn/", address: "/account/", token: "/account/" };
-    return `https://explorer.aptoslabs.com${paths[type]}${hash}${network}`;
   }
 }

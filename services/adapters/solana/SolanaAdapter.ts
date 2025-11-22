@@ -12,156 +12,216 @@ import {
 import {
   Connection,
   PublicKey,
-  Keypair,
   Transaction,
   SystemProgram,
   LAMPORTS_PER_SOL,
-  sendAndConfirmTransaction,
+  Keypair,
 } from "@solana/web3.js";
 
-import {
-  createMint,
-  getOrCreateAssociatedTokenAccount,
-  mintTo,
-  TOKEN_PROGRAM_ID,
-  getMint,
-} from "@solana/spl-token";
-
-// Solana wallet adapter types
-interface SolanaWalletAdapter {
-  publicKey: PublicKey | null;
-  connected: boolean;
-  connect(): Promise<void>;
-  disconnect(): Promise<void>;
-  signTransaction<T extends Transaction>(transaction: T): Promise<T>;
-  signAllTransactions<T extends Transaction>(transactions: T[]): Promise<T[]>;
-}
-
-// Phantom wallet interface
-interface PhantomWallet {
-  solana?: {
-    isPhantom: boolean;
-    publicKey: PublicKey;
-    isConnected: boolean;
-    connect(): Promise<{ publicKey: PublicKey }>;
-    disconnect(): Promise<void>;
-    signTransaction(tx: Transaction): Promise<Transaction>;
-    signAllTransactions(txs: Transaction[]): Promise<Transaction[]>;
-    on(event: string, callback: Function): void;
-    off(event: string, callback: Function): void;
-  };
-}
+import * as splToken from "@solana/spl-token";
 
 declare global {
-  interface Window extends PhantomWallet {}
+  interface Window {
+    solana?: any;
+  }
 }
 
 export class SolanaAdapter extends BaseChainAdapter {
   readonly chainType = "solana" as const;
   readonly chainInfo: ChainInfo;
-
   private connection: Connection;
-  private walletAdapter: SolanaWalletAdapter | null = null;
 
   constructor(network: "mainnet" | "devnet" | "testnet" = "devnet") {
     super();
-
-    const networks = {
-      mainnet: {
-        id: "solana-mainnet",
-        name: "Solana Mainnet",
-        rpcUrl: "https://api.mainnet-beta.solana.com",
-        explorerUrl: "https://explorer.solana.com",
-        isTestnet: false,
-      },
-      devnet: {
-        id: "solana-devnet",
-        name: "Solana Devnet",
-        rpcUrl: "https://api.devnet.solana.com",
-        explorerUrl: "https://explorer.solana.com?cluster=devnet",
-        isTestnet: true,
-      },
-      testnet: {
-        id: "solana-testnet",
-        name: "Solana Testnet",
-        rpcUrl: "https://api.testnet.solana.com",
-        explorerUrl: "https://explorer.solana.com?cluster=testnet",
-        isTestnet: true,
-      },
+    const endpoints = {
+      mainnet: "https://api.mainnet-beta.solana.com",
+      devnet: "https://api.devnet.solana.com",
+      testnet: "https://api.testnet.solana.com",
     };
-
-    const config = networks[network];
 
     this.chainInfo = {
-      ...config,
+      id: `solana-${network}`,
+      name: `Solana ${network.charAt(0).toUpperCase() + network.slice(1)}`,
       type: "solana",
-      nativeCurrency: {
-        name: "Solana",
-        symbol: "SOL",
-        decimals: 9,
-      },
+      isTestnet: network !== "mainnet",
+      nativeCurrency: { name: "Solana", symbol: "SOL", decimals: 9 },
+      explorerUrl: "https://explorer.solana.com",
+      rpcUrl: endpoints[network],
     };
 
-    this.connection = new Connection(config.rpcUrl, "confirmed");
+    this.connection = new Connection(endpoints[network], "confirmed");
   }
 
   async connect(): Promise<WalletInfo> {
-    const phantom = window.solana;
-
-    if (!phantom?.isPhantom) {
-      throw new Error("Phantom wallet not found. Please install Phantom.");
+    if (!window.solana || !window.solana.isPhantom) {
+      throw new Error("Phantom wallet not found");
     }
 
     try {
-      const response = await phantom.connect();
+      const resp = await window.solana.connect();
+      const address = resp.publicKey.toString();
 
       this.wallet = {
-        address: response.publicKey.toString(),
-        publicKey: response.publicKey.toString(),
+        address,
+        publicKey: address,
         chainType: "solana",
         chainId: this.chainInfo.id,
         isConnected: true,
         walletName: "Phantom",
       };
 
-      // Set up event listeners
-      phantom.on("accountChanged", (publicKey: PublicKey | null) => {
-        if (publicKey) {
-          this.wallet = { ...this.wallet!, address: publicKey.toString() };
-          this.emit("accountChange", publicKey.toString());
+      window.solana.on("accountChanged", (key: any) => {
+        if (key) {
+          this.wallet = { ...this.wallet!, address: key.toString() };
+          this.emit("accountChange", key.toString());
         } else {
           this.disconnect();
         }
       });
 
-      phantom.on("disconnect", () => {
-        this.emit("disconnect");
-      });
-
       return this.wallet;
-    } catch (error) {
-      throw new Error(`Failed to connect to Phantom: ${error}`);
+    } catch (err) {
+      throw new Error("User rejected connection");
     }
   }
 
   async disconnect(): Promise<void> {
-    const phantom = window.solana;
-    if (phantom) {
-      await phantom.disconnect();
-    }
+    if (window.solana) await window.solana.disconnect();
     this.wallet = null;
     this.emit("disconnect");
   }
 
   async getBalance(address?: string): Promise<TokenBalance> {
-    const pubkey = new PublicKey(address || this.wallet?.address || "");
-    const balance = await this.connection.getBalance(pubkey);
+    const addr = address || this.wallet?.address;
+    if (!addr) return { raw: "0", formatted: "0", symbol: "SOL", decimals: 9 };
 
+    try {
+      const bal = await this.connection.getBalance(new PublicKey(addr));
+      return {
+        raw: BigInt(bal),
+        formatted: (bal / LAMPORTS_PER_SOL).toFixed(4),
+        symbol: "SOL",
+        decimals: 9,
+      };
+    } catch {
+      return { raw: "0", formatted: "0", symbol: "SOL", decimals: 9 };
+    }
+  }
+
+  async deployToken(params: TokenDeployParams): Promise<DeployResult> {
+    if (!this.wallet) throw new Error("Wallet not connected");
+
+    try {
+      const payer = new PublicKey(this.wallet.address);
+      // Generate a new keypair for the Mint
+      const mintKeypair = Keypair.generate();
+
+      // 1. Calculate minimum lamports for rent exemption
+      const lamports = await splToken.getMinimumBalanceForRentExemptMint(
+        this.connection
+      );
+
+      const transaction = new Transaction();
+
+      // 2. Create Mint Account
+      transaction.add(
+        SystemProgram.createAccount({
+          fromPubkey: payer,
+          newAccountPubkey: mintKeypair.publicKey,
+          space: splToken.MINT_SIZE,
+          lamports,
+          programId: splToken.TOKEN_PROGRAM_ID,
+        }),
+        splToken.createInitializeMintInstruction(
+          mintKeypair.publicKey,
+          params.decimals,
+          payer, // Mint Authority
+          payer, // Freeze Authority
+          splToken.TOKEN_PROGRAM_ID
+        )
+      );
+
+      // 3. Create Associated Token Account (ATA) for the deployer
+      const associatedToken = await splToken.getAssociatedTokenAddress(
+        mintKeypair.publicKey,
+        payer,
+        false,
+        splToken.TOKEN_PROGRAM_ID,
+        splToken.ASSOCIATED_TOKEN_PROGRAM_ID
+      );
+
+      transaction.add(
+        splToken.createAssociatedTokenAccountInstruction(
+          payer,
+          associatedToken,
+          payer,
+          mintKeypair.publicKey,
+          splToken.TOKEN_PROGRAM_ID,
+          splToken.ASSOCIATED_TOKEN_PROGRAM_ID
+        )
+      );
+
+      // 4. Mint initial supply to the deployer's ATA
+      if (params.initialSupply > 0) {
+        // Handle decimals for big integer math
+        const amount =
+          BigInt(params.initialSupply) * BigInt(10 ** params.decimals);
+
+        transaction.add(
+          splToken.createMintToInstruction(
+            mintKeypair.publicKey,
+            associatedToken,
+            payer,
+            amount,
+            [],
+            splToken.TOKEN_PROGRAM_ID
+          )
+        );
+      }
+
+      // Get latest blockhash
+      const { blockhash } = await this.connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = payer;
+
+      // Mint Keypair must sign to create the account
+      transaction.partialSign(mintKeypair);
+
+      // Send to wallet for signature and submission
+      const signedTx = await window.solana.signTransaction(transaction);
+      const txHash = await this.connection.sendRawTransaction(
+        signedTx.serialize()
+      );
+
+      // Wait for confirmation
+      await this.connection.confirmTransaction(txHash);
+
+      return {
+        success: true,
+        transactionHash: txHash,
+        tokenMint: mintKeypair.publicKey.toString(),
+        explorerUrl: `${this.chainInfo.explorerUrl}/tx/${txHash}?cluster=${
+          this.chainInfo.isTestnet ? "devnet" : "mainnet"
+        }`,
+      };
+    } catch (err: any) {
+      console.error(err);
+      return {
+        success: false,
+        transactionHash: "",
+        explorerUrl: "",
+        error: err.message || "Solana deployment failed",
+      };
+    }
+  }
+
+  async estimateDeploymentFee(params: TokenDeployParams): Promise<GasEstimate> {
+    // Approx cost: Rent for Mint + ATA + Transaciton Fee
+    // ~0.00146 SOL + ~0.00204 SOL + ~0.000005 SOL
     return {
-      raw: BigInt(balance),
-      formatted: (balance / LAMPORTS_PER_SOL).toFixed(4),
-      symbol: "SOL",
-      decimals: 9,
+      estimatedFee: "0.0035",
+      feeToken: "SOL",
+      gasUnits: BigInt(3500000),
     };
   }
 
@@ -174,134 +234,23 @@ export class SolanaAdapter extends BaseChainAdapter {
     }
   }
 
-  async estimateDeploymentFee(params: TokenDeployParams): Promise<GasEstimate> {
-    // SPL Token creation costs approximately:
-    // - Mint account rent: ~0.00144 SOL
-    // - Associated token account: ~0.00203 SOL
-    // - Transaction fees: ~0.00001 SOL
-    const estimatedLamports = 0.005 * LAMPORTS_PER_SOL;
-
-    return {
-      estimatedFee: (estimatedLamports / LAMPORTS_PER_SOL).toFixed(6),
-      feeToken: "SOL",
-      gasUnits: BigInt(estimatedLamports),
-    };
-  }
-
-  async deployToken(params: TokenDeployParams): Promise<DeployResult> {
-    if (!this.wallet || !window.solana) {
-      throw new Error("Wallet not connected");
-    }
-
-    try {
-      const payer = new PublicKey(this.wallet.address);
-
-      // Generate a new keypair for the mint
-      const mintKeypair = Keypair.generate();
-
-      // Create the mint
-      const mint = await createMint(
-        this.connection,
-        {
-          publicKey: payer,
-          secretKey: new Uint8Array(), // Will use wallet to sign
-          signTransaction: async (tx) => {
-            return await window.solana!.signTransaction(tx);
-          },
-          signAllTransactions: async (txs) => {
-            return await window.solana!.signAllTransactions(txs);
-          },
-        } as any,
-        payer, // Mint authority
-        payer, // Freeze authority (null for no freeze)
-        params.decimals || 9,
-        mintKeypair,
-        undefined,
-        TOKEN_PROGRAM_ID
-      );
-
-      // Create associated token account for the payer
-      const tokenAccount = await getOrCreateAssociatedTokenAccount(
-        this.connection,
-        {
-          publicKey: payer,
-          secretKey: new Uint8Array(),
-          signTransaction: async (tx) => window.solana!.signTransaction(tx),
-          signAllTransactions: async (txs) =>
-            window.solana!.signAllTransactions(txs),
-        } as any,
-        mint,
-        payer
-      );
-
-      // Mint initial supply to the token account
-      const initialSupply =
-        BigInt(params.initialSupply) * BigInt(10 ** (params.decimals || 9));
-
-      await mintTo(
-        this.connection,
-        {
-          publicKey: payer,
-          secretKey: new Uint8Array(),
-          signTransaction: async (tx) => window.solana!.signTransaction(tx),
-          signAllTransactions: async (txs) =>
-            window.solana!.signAllTransactions(txs),
-        } as any,
-        mint,
-        tokenAccount.address,
-        payer,
-        initialSupply
-      );
-
-      return {
-        success: true,
-        transactionHash: mint.toString(), // Use mint address as reference
-        tokenMint: mint.toString(),
-        explorerUrl: `${this.chainInfo.explorerUrl}/address/${mint.toString()}`,
-      };
-    } catch (error) {
-      return {
-        success: false,
-        transactionHash: "",
-        explorerUrl: "",
-        error: error instanceof Error ? error.message : "Deployment failed",
-      };
-    }
+  formatAddress(address: string, shorten = true): string {
+    if (!address) return "";
+    if (!shorten) return address;
+    return `${address.slice(0, 4)}...${address.slice(-4)}`;
   }
 
   async waitForTransaction(hash: string): Promise<TransactionReceipt> {
-    const latestBlockhash = await this.connection.getLatestBlockhash();
-
-    const confirmation = await this.connection.confirmTransaction({
-      signature: hash,
-      blockhash: latestBlockhash.blockhash,
-      lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-    });
-
-    return {
-      hash,
-      status: confirmation.value.err ? "failed" : "success",
-      confirmations: 1,
-    };
+    await this.connection.confirmTransaction(hash);
+    return { hash, status: "success", confirmations: 1 };
   }
 
   async getTransactionStatus(hash: string): Promise<TransactionReceipt> {
     const status = await this.connection.getSignatureStatus(hash);
-
     return {
       hash,
-      status: status.value?.err
-        ? "failed"
-        : status.value?.confirmationStatus === "finalized"
-        ? "success"
-        : "pending",
+      status: status.value?.err ? "failed" : "success",
       confirmations: status.value?.confirmations || 0,
     };
-  }
-
-  getExplorerUrl(hash: string, type: "tx" | "address" | "token"): string {
-    const cluster = this.chainInfo.isTestnet ? "?cluster=devnet" : "";
-    const paths = { tx: "/tx/", address: "/address/", token: "/address/" };
-    return `https://explorer.solana.com${paths[type]}${hash}${cluster}`;
   }
 }
